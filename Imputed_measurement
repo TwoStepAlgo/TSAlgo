@@ -1,0 +1,523 @@
+def MI_step1(Make_comorbidity_column_no_env):
+    df_original = Make_comorbidity_column_no_env
+    # cap SpO2_remedy at 100 and floor it at 90
+    df_original["SpO2_remedy"] = df_original["SpO2_remedy"].clip(lower=90, upper=100)
+    for c in ["SpO2_remedy", "Heart_rate_remedy", "Respiratory_rate_remedy"]:
+        df_original[c] = df_original[c].astype("float32")
+    # ────────────────────────────────────────────────────────────────
+    # 1 · 多重插补 (M = 5)
+    # ────────────────────────────────────────────────────────────────
+    M = 4
+    mi_cols = ["SpO2_remedy", "Heart_rate_remedy", "Respiratory_rate_remedy"]      # 要插补的数值列
+    aux_cols = ["age"]                                        # 分类辅助列
+    all_mi_cols = mi_cols + aux_cols
+
+    imp = IterativeImputer(
+        estimator        = BayesianRidge(),
+        max_iter         = 20,
+        sample_posterior = True,
+        imputation_order = "ascending",
+    )
+
+    imputed_sets = []
+    for m in range(M):
+        seed = 1000 + m
+        np.random.seed(seed)
+        imp.random_state = seed
+
+        df_imp = df_original.copy()
+        df_imp[all_mi_cols] = imp.fit_transform(df_imp[all_mi_cols])
+        df_imp["imp_id"] = m + 1
+        imputed_sets.append(df_imp)
+
+    df_MI_long = pd.concat(imputed_sets, ignore_index=True)
+    
+    return(MI_step1)
+
+def Get_score_columns_step1_imputation(MI_step1):
+    df = MI_step1
+    # Adding comorbidity_score
+    df = df.withColumn('comorbidity_score', when(df.comorbidity_number >= 2, 1).otherwise(0))
+
+    # Adding HR_score
+    df = df.withColumn('HR_score', when(df.Heart_rate_remedy > 100, 1).otherwise(0))
+
+    # Adding RR_score
+    df = df.withColumn('RR_score', when(df.Respiratory_rate_remedy >= 30, 2).otherwise(0))
+
+    # Adding SpO2_score
+    df = df.withColumn('SpO2_score', when(df.SpO2_remedy < 93, 2).otherwise(0))
+
+    # Adding age_score
+    df = df.withColumn('age_score', 
+                    when(df.age < 55, 0)
+                    .when((df.age >= 55) & (df.age <= 64), 2)
+                    .when((df.age >= 65) & (df.age <= 74), 3)
+                    .when(df.age >= 75, 5)
+                    .otherwise(0)) # Handling unexpected cases, though you might not need this
+
+    df = df.withColumn('step_one_summary_score', 
+                    col('comorbidity_score') + 
+                    col('HR_score') + 
+                    col('RR_score') + 
+                    col('SpO2_score') + 
+                    col('age_score'))
+
+
+
+    return(Get_score_columns_step1_imputation)
+
+
+def Get_majority_score_columns_step1_imputation_with_imputation(Get_score_columns_step1_imputation):
+    df_scores = Get_score_columns_step1_imputation
+    # ① 先算出每个 (person_id, condition_start_date, step_one_summary_score) 的出现次数
+    w_cnt = Window.partitionBy(
+        "person_id", "condition_start_date", "step_one_summary_score"
+    )
+    df_with_cnt = df_scores.withColumn("score_cnt", F.count("*").over(w_cnt))
+
+    # ② 在同一 (person_id, condition_start_date) 内，按出现次数降序、分数升序排
+    w_pick = (
+        Window.partitionBy("person_id", "condition_start_date")
+            .orderBy(F.desc("score_cnt"), F.asc("step_one_summary_score"))
+    )
+
+    # ③ 取多数票的那一行（ ties 用较小分数 ）
+    majority_df = (
+        df_with_cnt.withColumn("rn", F.row_number().over(w_pick))
+                .filter("rn = 1")                   # 只保留第一名
+                .drop("rn", "score_cnt")            # 不再需要这两列可删除
+                .withColumnRenamed("step_one_summary_score", "step_one_summary_score")
+    )
+
+    return(Get_majority_score_columns_step1_imputation_with_imputation)
+
+def higher_step1_imputed(Get_majority_score_columns_step1_imputation_with_imputation):
+    df = Get_majority_score_columns_step1_imputation_with_imputation
+    df = df.filter(col("step_one_summary_score") >= 7)
+
+    df_selected = df.select(col('person_id'),col("condition_start_date"), col("age"),col("death"),col('sex'),
+                                col("Heart_rate_remedy"),col("Respiratory_rate_remedy"),col("SpO2_remedy"),col("BUN_remedy"),
+                                col("NLR_remedy"),col("Neu_remedy"),col("CRP_remedy"),col("PLA_remedy"),
+                                col("comorbidity_number"))
+
+    return(higher_step1_imputed)
+
+def lower_step1_imputed(Get_majority_score_columns_step1_imputation_with_imputation):
+    df = Get_majority_score_columns_step1_imputation_with_imputation
+    df = df.filter(col("step_one_summary_score") == 0)
+
+    df_selected = df.select(col('person_id'),col("condition_start_date"), col("age"),col("death"),col('sex'),
+                                col("Heart_rate_remedy"),col("Respiratory_rate_remedy"),col("SpO2_remedy"),col("BUN_remedy"),
+                                col("NLR_remedy"),col("Neu_remedy"),col("CRP_remedy"),col("PLA_remedy"),
+                                col("comorbidity_number"))
+
+    return(lower_step1_imputed)
+
+def moderate_step1_imputed(Get_majority_score_columns_step1_imputation_with_imputation):
+    df = Get_majority_score_columns_step1_imputation_with_imputation
+    df = df.filter( (df.step_one_summary_score  >= "1") & (df.step_one_summary_score  <= "6"))
+
+    df_selected = df.select(col('person_id'),col("condition_start_date"), col("age"),col("death"),col("sex"),
+                                col("Heart_rate_remedy"),col("Respiratory_rate_remedy"),col("SpO2_remedy"),col("BUN_remedy"),
+                                col("NLR_remedy"),col("Neu_remedy"),col("CRP_remedy"),col("PLA_remedy"),
+                                col("comorbidity_number"))
+
+    # clip/floor each lab value to the desired range
+    df_selected = (
+        df_selected
+            .withColumn("BUN_remedy", F.greatest(F.lit(1),   F.least(F.col("BUN_remedy"),  F.lit(260))))
+            .withColumn("NLR_remedy", F.greatest(F.lit(0),   F.least(F.col("NLR_remedy"),  F.lit(200))))
+            .withColumn("Neu_remedy", F.greatest(F.lit(0.16),F.least(F.col("Neu_remedy"), F.lit(100))))
+            .withColumn("CRP_remedy", F.greatest(F.lit(0.1), F.least(F.col("CRP_remedy"), F.lit(600))))
+            .withColumn("PLA_remedy", F.greatest(F.lit(0),   F.least(F.col("PLA_remedy"), F.lit(1000))))
+    )
+
+
+    return(moderate_step1_imputed)
+
+def MI_step2(moderate_step1_imputed):
+    df_original = moderate_step1_imputed
+    for c in ["SpO2_remedy", "Heart_rate_remedy", "Respiratory_rate_remedy", "BUN_remedy", "NLR_remedy", "Neu_remedy", "CRP_remedy", "PLA_remedy"]:
+        df_original[c] = df_original[c].astype("float32")
+    # ────────────────────────────────────────────────────────────────
+    # 1 · 多重插补 (M = 5)
+    # ────────────────────────────────────────────────────────────────
+    M = 4
+    mi_cols = ["SpO2_remedy", "Heart_rate_remedy", "Respiratory_rate_remedy", "BUN_remedy", "NLR_remedy", "Neu_remedy", "CRP_remedy", "PLA_remedy"]      # 要插补的数值列
+    aux_cols = []                                        # 分类辅助列
+    all_mi_cols = mi_cols + aux_cols
+
+    imp = IterativeImputer(
+        estimator        = BayesianRidge(),
+        max_iter         = 20,
+        sample_posterior = True,
+        imputation_order = "ascending",
+    )
+
+    imputed_sets = []
+    for m in range(M):
+        seed = 1000 + m
+        np.random.seed(seed)
+        imp.random_state = seed
+
+        df_imp = df_original.copy()
+        df_imp[all_mi_cols] = imp.fit_transform(df_imp[all_mi_cols])
+        df_imp["imp_id"] = m + 1
+        imputed_sets.append(df_imp)
+
+    df_MI_long = pd.concat(imputed_sets, ignore_index=True)
+    
+    return(MI_step2)
+
+def Get_score_columns_step2_imp(MI_step2):
+    df = MI_step2
+    # Adding age-related score
+    df = df.withColumn('age_score',
+                    when(df.age < 55, 0)
+                    .when((df.age >= 55) & (df.age < 65), 1)
+                    .when((df.age >= 65) & (df.age < 75), 2)
+                    .when(df.age >= 75, 3))
+
+    # Adding SpO2-related score
+    df = df.withColumn('SpO2_score', when(df.SpO2_remedy < 93, 2).otherwise(0))
+
+    # Adding BUN-related score
+    df = df.withColumn('BUN_score', when(df.BUN_remedy > 20, 2).otherwise(0))
+
+    # Adding NLR-related score
+    df = df.withColumn('NLR_score', when(df.NLR_remedy > 3.7, 2).otherwise(0))
+
+    # Adding NEU-related score
+    df = df.withColumn('NEU_score', when(df.Neu_remedy > 6.3, 2).otherwise(0))
+
+    # Adding Platelets-related score
+    df = df.withColumn('Platelets_score', when(df.PLA_remedy > 350, 2).otherwise(0))
+
+    # Adding CRP-related score
+    df = df.withColumn('CRP_score', when(df.CRP_remedy > 10, 1).otherwise(0))
+
+    # Now, sum up all the score columns to create a step_two_summary_score
+    df = df.withColumn('step_two_summary_score', 
+                    col('age_score') + 
+                    col('SpO2_score') + 
+                    col('BUN_score') + 
+                    col('NLR_score') + 
+                    col('NEU_score') + 
+                    col('Platelets_score') + 
+                    col('CRP_score'))
+    
+    return(Get_score_columns_step2_imp)
+
+def Get_majority_score_columns_step2_imputation_with_imputation(Get_score_columns_step2_imp):
+    df_scores = Get_score_columns_step2_imp
+    # ① 先算出每个 (person_id, condition_start_date, step_one_summary_score) 的出现次数
+    w_cnt = Window.partitionBy(
+        "person_id", "condition_start_date", "step_two_summary_score"
+    )
+    df_with_cnt = df_scores.withColumn("score_cnt", F.count("*").over(w_cnt))
+
+    # ② 在同一 (person_id, condition_start_date) 内，按出现次数降序、分数升序排
+    w_pick = (
+        Window.partitionBy("person_id", "condition_start_date")
+            .orderBy(F.desc("score_cnt"), F.asc("step_two_summary_score"))
+    )
+
+    # ③ 取多数票的那一行（ ties 用较小分数 ）
+    majority_df = (
+        df_with_cnt.withColumn("rn", F.row_number().over(w_pick))
+                .filter("rn = 1")                   # 只保留第一名
+                .drop("rn", "score_cnt")            # 不再需要这两列可删除
+                .withColumnRenamed("step_two_summary_score", "step_two_summary_score")
+    )
+
+    return(Get_majority_score_columns_step2_imputation_with_imputation)
+
+def higher_step2_imp(Get_majority_score_columns_step2_imputation_with_imputation):
+    df = Get_majority_score_columns_step2_imputation_with_imputation
+    df = df.filter(col("step_two_summary_score") >= 7).distinct()
+    
+    return(higher_step2_imp)
+
+def moderate_step2_imp(Get_majority_score_columns_step2_imputation_with_imputation):
+    df = Get_majority_score_columns_step2_imputation_with_imputation
+    df = df.filter( (df.step_two_summary_score  >= "4") & (df.step_two_summary_score  <= "6")).distinct()
+
+    return(moderate_step2_imp)
+
+def lower_step2_imp(Get_majority_score_columns_step2_imputation_with_imputation):
+    df = Get_majority_score_columns_step2_imputation_with_imputation
+    df = df.filter(col("step_two_summary_score") <= 3).distinct()
+
+    return(lower_step2_imp)
+
+def Combine_step2_imp(higher_step2_imp, moderate_step2_imp, lower_step2_imp):
+    df1 = lower_step2_imp
+    df2 = moderate_step2_imp
+    df3 = higher_step2_imp
+    df_union = df1.union(df2)
+    df_union = df_union.union(df3)
+
+    return(Combine_step2_imp)
+
+def Combine_imp_step2_after_omicron(Combine_step2_imp):
+    df = Combine_step2_imp
+    filtered_df = df.filter(col("condition_start_date") > "2021-11-20")
+
+
+    return(Combine_imp_step2_after_omicron)
+
+def Combine_imp_step2_before_omicron(Combine_step2_imp):
+    df = Combine_step2_imp
+    filtered_df = df.filter(col("condition_start_date") <= "2021-11-20")
+
+
+    return(Combine_imp_step2_before_omicron)
+
+Imp_all_risk_predicted_prob_multiple_visits_TS_Cstat <- function(Combine_step2_imp,Combine_step1_imp, n_bootstrap = 1000, alpha = 0.05) {
+    validation_set_step1 = Combine_step1_imp
+    y_true_step1 <- Combine_step1_imp$death
+    
+    validation_set_step2 = Combine_step2_imp
+    y_true_step2 <- Combine_step2_imp$death
+
+    #########################################################################################################
+    # Define the coefficients
+    coef_age_step1 <- c(0, 2, 3, 5)
+    coef_RR_step1 <- 2
+    coef_SPO2_step1 <- 2
+    coef_comorbidity_step1 <- 1
+    coef_HPR_step1 <- 1
+
+    # Calculate the linear combinations and predicted probabilities
+    linear_combination_step1 <- coef_HPR_step1 * (validation_set_step1$Heart_rate_remedy > 100) + coef_RR_step1 * (validation_set_step1$Respiratory_rate_remedy >= 30) + coef_SPO2_step1 * (validation_set_step1$SpO2_remedy < 93) +
+                          coef_comorbidity_step1 * (validation_set_step1$comorbidity_number > 2) +
+                          coef_age_step1[1] * (validation_set_step1$age < 55) + coef_age_step1[2] * (validation_set_step1$age >= 55 & validation_set_step1$age < 65) +
+                          coef_age_step1[3] * (validation_set_step1$age >= 65 & validation_set_step1$age < 75) + coef_age_step1[4] * (validation_set_step1$age >= 75)
+
+    predicted_probabilities_step1 <- 1 / (1 + exp(-linear_combination_step1))
+
+    #########################################################################################################
+
+    # Define the coefficients
+    coef_age_step2 <- c(0, 1, 2, 3)
+    coef_SpO2_step2 <- 2
+    coef_BUN_step2 <- 2
+    coef_NLR_step2 <- 2
+    coef_NEU_step2 <- 2
+    coef_PLA_step2 <- 2
+    coef_CRP_step2 <- 1
+
+    # Calculate the linear combinations and predicted probabilities
+    linear_combination_step2 <- coef_SpO2_step2 * (validation_set_step2$SpO2_remedy < 93) + coef_BUN_step2 * (validation_set_step2$BUN_remedy > 20) + 
+                          coef_NLR_step2 * (validation_set_step2$NLR_remedy > 3.7) + coef_NEU_step2 * (validation_set_step2$Neu_remedy > 6.3) + 
+                          coef_PLA_step2 * (validation_set_step2$PLA_remedy >= 350) + coef_CRP_step2 * (validation_set_step2$CRP_remedy > 10) +
+                          coef_age_step2[1] * (validation_set_step2$age < 55) + coef_age_step2[2] * (validation_set_step2$age >= 55 & validation_set_step2$age < 65) +
+                          coef_age_step2[3] * (validation_set_step2$age >= 65 & validation_set_step2$age < 75) + coef_age_step2[4] * (validation_set_step2$age >= 75)
+
+    predicted_probabilities_step2 <- 1 / (1 + exp(-linear_combination_step2))
+
+    #########################################################################################################
+    # Combine predictions and true labels
+    predicted_probabilities <- c(predicted_probabilities_step1, predicted_probabilities_step2)
+    y_true <- c(y_true_step1, y_true_step2)
+    
+    # Separate predictions and labels by class
+    y_true <- as.numeric(y_true)  # Ensure binary 0 and 1
+    pos_scores <- predicted_probabilities[y_true == 1]
+    neg_scores <- predicted_probabilities[y_true == 0]
+    
+    n_pos <- length(pos_scores)
+    n_neg <- length(neg_scores)
+    
+    # Calculate pairwise comparisons between positive and negative samples
+    V10 <- sapply(pos_scores, function(p) mean(p > neg_scores) + 0.5 * mean(p == neg_scores))
+    V01 <- sapply(neg_scores, function(n) mean(n < pos_scores) + 0.5 * mean(n == pos_scores))
+    
+    # Calculate the AUC
+    auc <- mean(V10)
+    
+    # Calculate covariance of V10 and V01
+    var_V10 <- var(V10) / n_pos
+    var_V01 <- var(V01) / n_neg
+    
+    # Calculate the variance of AUC
+    auc_var <- var_V10 + var_V01
+    
+    # Calculate standard error of AUC
+    auc_se <- sqrt(auc_var)
+    
+    # Calculate confidence interval
+    z_alpha <- qnorm(1 - alpha / 2)  # For a 95% CI, alpha is 0.05
+    ci_lower <- auc - z_alpha * auc_se
+    ci_upper <- auc + z_alpha * auc_se
+    
+    # Return AUC and confidence interval
+    return(data.frame(AUC = auc, CI_lower = ci_lower, CI_upper = ci_upper))
+
+}
+
+Full_all_risk_predicted_prob_multiple_visits_TS_Cstat_all_details_table_recalib <-
+  function(Combine_step2_imp,
+           Combine_step1_imp,
+           alpha = 0.05,
+           train_frac = 0.70,
+           seed = 2024) {
+
+  ## ------------------------------------------------------------------------
+  ## 0.  Bring in data & outcomes
+  ## ------------------------------------------------------------------------
+  validation_set_step1 <- Combine_step1_imp
+  y_true_step1         <- validation_set_step1$death
+
+  validation_set_step2 <- Combine_step2_imp
+  y_true_step2         <- validation_set_step2$death
+
+  ## ------------------------------------------------------------------------
+  ## 1.  STEP‑1  – build score, estimate intercept, probs
+  ## ------------------------------------------------------------------------
+  coef_age_step1      <- c(0, 2, 3, 5)
+  coef_RR_step1       <- 2
+  coef_SPO2_step1     <- 2
+  coef_comorbidity_step1 <- 1
+  coef_HPR_step1      <- 1
+
+  linear_component_step1 <- with(
+    validation_set_step1,
+    coef_HPR_step1  * (Heart_rate_remedy        > 100) +
+    coef_RR_step1   * (Respiratory_rate_remedy >= 30)  +
+    coef_SPO2_step1 * (SpO2_remedy             <  93) +
+    coef_comorbidity_step1 * (comorbidity_number > 2)  +
+    coef_age_step1[1]*(age < 55)                        +
+    coef_age_step1[2]*(age >= 55 & age < 65)            +
+    coef_age_step1[3]*(age >= 65 & age < 75)            +
+    coef_age_step1[4]*(age >= 75)
+  )
+
+  intercept_step1 <- coef(glm(y_true_step1 ~ 1,
+                              family = binomial,
+                              offset = linear_component_step1))[1]
+
+  p_step1 <- plogis(intercept_step1 + linear_component_step1)
+
+  ## ------------------------------------------------------------------------
+  ## 2.  STEP‑2  – same workflow
+  ## ------------------------------------------------------------------------
+  coef_age_step2  <- c(0, 1, 2, 3)
+  coef_SpO2_step2 <- 2 ; coef_BUN_step2 <- 2 ; coef_NLR_step2 <- 2
+  coef_NEU_step2  <- 2 ; coef_PLA_step2 <- 2 ; coef_CRP_step2 <- 1
+
+  linear_component_step2 <- with(
+    validation_set_step2,
+    coef_SpO2_step2 * (SpO2_remedy <  93)  +
+    coef_BUN_step2  * (BUN_remedy  >  20)  +
+    coef_NLR_step2  * (NLR_remedy  >  3.7) +
+    coef_NEU_step2  * (Neu_remedy  >  6.3) +
+    coef_PLA_step2  * (PLA_remedy  >= 350) +
+    coef_CRP_step2  * (CRP_remedy  >  10)  +
+    coef_age_step2[1]*(age < 55)                      +
+    coef_age_step2[2]*(age >= 55 & age < 65)          +
+    coef_age_step2[3]*(age >= 65 & age < 75)          +
+    coef_age_step2[4]*(age >= 75)
+  )
+
+  intercept_step2 <- coef(glm(y_true_step2 ~ 1,
+                              family = binomial,
+                              offset = linear_component_step2))[1]
+
+  p_step2 <- plogis(intercept_step2 + linear_component_step2)
+
+  ## ------------------------------------------------------------------------
+  ## 3.  Combine both tiers
+  ## ------------------------------------------------------------------------
+  df_all <- data.frame(
+    y      = c(y_true_step1, y_true_step2),
+    p_hat  = c(p_step1,      p_step2)
+  )
+
+  ## ------------------------------------------------------------------------
+  ## 4.  Train / test split
+  ## ------------------------------------------------------------------------
+  set.seed(seed)
+  n         <- nrow(df_all)
+  idx_train <- sample.int(n, size = floor(train_frac * n))
+  train     <- df_all[idx_train, ]
+  test      <- df_all[-idx_train,  ]
+
+  ## ------------------------------------------------------------------------
+  ## 5.  Isotonic fit on training set
+  ## ------------------------------------------------------------------------
+  clip01 <- function(p) pmin(pmax(p, 1e-6), 1 - 1e-6)
+
+  ord_tr         <- order(train$p_hat)
+  iso_fit        <- isoreg(train$p_hat[ord_tr], train$y[ord_tr])
+
+  iso_map <- approxfun(
+    x      = train$p_hat[ord_tr],
+    y      = clip01(iso_fit$yf),
+    yleft  = min(clip01(iso_fit$yf)),
+    yright = max(clip01(iso_fit$yf)),
+    ties   = "ordered"
+  )
+
+  ## ------------------------------------------------------------------------
+  ## 6.  Apply mapping to test set
+  ## ------------------------------------------------------------------------
+  test$p_iso <- clip01(iso_map(test$p_hat))
+
+  ## ------------------------------------------------------------------------
+  ## 7.  Metrics on test set
+  ## ------------------------------------------------------------------------
+  logit <- function(p) log(p / (1 - p))
+  brier <- function(p, y) mean((p - y)^2)
+
+  HL <- function(p, y, g = 10) {
+    p <- clip01(p)
+    cuts <- quantile(p, probs = seq(0, 1, length.out = g + 1), type = 8)
+    bin  <- cut(p, breaks = unique(cuts), include.lowest = TRUE, labels = FALSE)
+    tab  <- aggregate(cbind(obs = y, exp = p) ~ bin, FUN = sum)
+    tab$n <- as.numeric(table(bin)[as.character(tab$bin)])
+    chi2 <- sum((tab$obs - tab$exp)^2 / (tab$exp * (1 - tab$exp / tab$n)))
+    pval <- 1 - pchisq(chi2, df = g - 2)
+    c(chi2 = chi2, pval = pval)
+  }
+
+  alpha_bef <- coef(glm(test$y ~ 1, family = binomial,
+                        offset = logit(test$p_hat)))[1]
+  beta_bef  <- coef(glm(test$y ~ logit(test$p_hat) - 1,
+                        family = binomial))[1]
+  hl_bef    <- HL(test$p_hat, test$y)
+  brier_bef <- brier(test$p_hat, test$y)
+
+  alpha_iso <- coef(glm(test$y ~ 1, family = binomial,
+                        offset = logit(test$p_iso)))[1]
+  beta_iso  <- coef(glm(test$y ~ logit(test$p_iso) - 1,
+                        family = binomial))[1]
+  hl_iso    <- HL(test$p_iso, test$y)
+  brier_iso <- brier(test$p_iso, test$y)
+
+  calibration_summary <- data.frame(
+    Metric = c("Calibration intercept (alpha)",
+               "Calibration slope (beta)",
+               "Brier score",
+               "Hosmer-Lemeshow chi2 (g=10)",
+               "Hosmer-Lemeshow p-value"),
+    Before = c(round(alpha_bef, 3),
+               round(beta_bef,  3),
+               round(brier_bef, 4),
+               round(hl_bef["chi2"], 2),
+               sprintf("%.4g", hl_bef["pval"])),
+    After  = c(round(alpha_iso, 3),
+               round(beta_iso,  3),
+               round(brier_iso, 4),
+               round(hl_iso["chi2"], 2),
+               sprintf("%.4g", hl_iso["pval"])),
+    row.names = NULL
+  )
+  return(calibration_summary)
+}
+
+
+
+
+

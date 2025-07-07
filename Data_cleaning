@@ -347,10 +347,84 @@ def Combine_different_measurement_names_no_env(Match_with_COUNTY_ratio):
         )
     )
 
-
-
-
     return(Combine_different_measurement_names_no_env)
+
+def Remove_total_ratio_and_county(Combine_different_measurement_names_no_env):
+    df = Combine_different_measurement_names_no_env
+
+    df = df.drop("TOT_RATIO", "COUNTY")
+    df = df.dropDuplicates(["person_id", "condition_start_date"])
+
+    return(Remove_total_ratio_and_county)
+
+def Match_with_death_info_no_env(Remove_total_ratio_and_county, death):
+    df1 = Remove_total_ratio_and_county
+    df2 = death
+
+    df2 = df2.select(col('person_id'), col('death_date'))
+    # Step 1: Perform a left join between df1 and df2 on person_id
+    df_joined = df1.join(df2, "person_id", "left")
+    df_joined = df_joined.dropDuplicates(["person_id", "condition_start_date"])
+    # Step 2: Use a window function to identify the latest condition_start_date for each person_id
+    windowSpec = Window.partitionBy("person_id").orderBy(col("condition_start_date").desc())
+
+    # Mark as death == 1 if condition_start_date is within 60 days before the death_date
+    df_joined = df_joined.withColumn("death",
+                                    when((col("death_date").isNotNull()) & 
+                                        (datediff(col("death_date"), col("condition_start_date")) <= 90), 1)
+                                    .otherwise(0))
+
+    # Filter the DataFrame to include only rows where age is greater than 18
+    df_joined = df_joined.filter(col("age") >= 18)
+
+    return(Match_with_death_info_no_env)
+
+def Match_w_Asthma_no_env(Match_with_death_info_no_env, Asthma_dataset_no_env):
+    df1 = Match_with_death_info_no_env
+    df2 = Asthma_dataset_no_env
+
+    df2 = df2.withColumnRenamed('person_id', 'person_id_asthma')
+    
+    df1_with_indicator = df1.join(df2.select('person_id_asthma').distinct(), df1.person_id == df2.person_id_asthma, 'left_outer')
+
+    # Create the ASTHMA_indicator column based on whether a match was found
+    df1_with_indicator = df1_with_indicator.withColumn(
+        'ASTHMA_indicator', 
+        F.when(F.col('person_id_asthma').isNull(), 0).otherwise(1)
+    )
+
+    # Drop the duplicate person_id column coming from df2 if not needed
+    df1_with_indicator = df1_with_indicator.drop(col("person_id_asthma"))
+    df1_with_indicator = df1_with_indicator.drop(col('patient_death_indicator'))
+
+    return(Match_w_Asthma_no_env)
+
+def Make_comorbidity_column_no_env(Match_w_Asthma_no_env):
+    df = Match_w_Asthma_no_env
+
+    df = df.withColumn(
+    "DIABETES_indicator",
+    when(
+        (col("DIABETESCOMPLICATED_indicator") == 1) | (col("DIABETESUNCOMPLICATED_indicator") == 1),
+        1
+        ).otherwise(0)
+    )
+
+    # List of column names to sum
+    comorbidity_to_sum = ['CEREBROVASCULARDISEASE_indicator', 'CHRONICLUNGDISEASE_indicator', 
+                            'CONGESTIVEHEARTFAILURE_indicator', 'DIABETES_indicator',
+                            'MYOCARDIALINFARCTION_indicator','ASTHMA_indicator']  # Add your column names here
+    # Create a column expression that sums all the specified columns
+    sum_expression = reduce(lambda a, b: a + b, (col(x) for x in comorbidity_to_sum))
+    # Add a new column to the DataFrame with the sum of the specified columns
+    df = df.withColumn('comorbidity_number', sum_expression)
+
+    return(Make_comorbidity_column_no_env)
+
+
+
+
+
 
 
 

@@ -1,0 +1,363 @@
+# Data cleaning functions
+def Filter_covid_patient_with_zip(Logic_Liaison_All_patients_summary_facts_table_lds_1):
+    df = Logic_Liaison_All_patients_summary_facts_table_lds_1
+    filtered_df = df.filter(
+    (col("postal_code").isNotNull())
+    )
+
+    return(Filter_covid_patient_with_zip)
+
+def Use_contains_U071_filter_COVID_records(condition_occurrence):
+    df1 = condition_occurrence
+    df_COVID = df1.filter(col("condition_source_value").contains("U07.1"))
+
+    return(Use_contains_U071_filter_COVID_records)
+
+def visits_and_windows(Use_contains_U071_filter_COVID_records, Filter_covid_patient_with_zip):
+    df1 = Use_contains_U071_filter_COVID_records
+    df2 = Filter_covid_patient_with_zip
+    # Perform an inner join on the 'person_id' column
+    # Selecting multiple columns by name
+    selected_df1 = df1.select("person_id", "condition_start_date")
+
+    # Rename the 'person_id' column in df1 to 'person_id_records'
+    df1_renamed = selected_df1.withColumnRenamed("person_id", "person_id_records")
+    df_joined = df1_renamed.join(df2, df1_renamed.person_id_records == df2.person_id, 'left')
+
+    return(visits_and_windows)
+
+def twentyeight_days_window_screening(visits_and_windows):
+    df = visits_and_windows
+    # Ensure condition_start_date is a date type
+    df = df.withColumn("condition_start_date", to_date(col("condition_start_date")))
+
+    # Define window specification
+    windowSpec = Window.partitionBy("person_id").orderBy("condition_start_date")
+
+    # Calculate the difference in days from the previous row
+    df = df.withColumn("prev_date_diff", 
+                    abs(datediff(col("condition_start_date"), 
+                                    lag("condition_start_date", 1).over(windowSpec))))
+
+    # Filter rows where the difference is null (first occurrence) or greater than 28 days
+    filtered_df = df.filter((col("prev_date_diff").isNull()) | (col("prev_date_diff") >= 28))
+
+    # Optionally, remove the "prev_date_diff" column if you want to revert to the original DataFrame structure
+    filtered_df = filtered_df.drop("prev_date_diff")
+
+    return(filtered_df)
+
+def reorganize_measurement_dataset(measurement):
+    df = measurement
+
+    # Replace spaces with underscores in "measurement_concept_name" column
+    df_modified = df.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", " ", "_"))
+    df_modified = df_modified.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", "[#/]", ""))
+    df_modified = df_modified.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", "-", "_"))
+    df_modified = df_modified.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", "[(.)]", "_"))
+    df_modified = df_modified.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", "__", "_"))
+
+    #measurement_list = ['Heart rate','Heart rate by Pulse oximetry','Pulse rate','Respiratory rate','Oxygen saturation in Arterial blood by Pulse oximetry',
+#                        'Blood urea nitrogen measurement',
+#                        'Neutrophils [#/volume] in Blood by Automated count','Neutrophils [#/volume] in Blood','Neutrophils [#/volume] in Blood by Manual count',
+#                        'Lymphocytes [#/volume] in Blood by Automated count','Lymphocytes [#/volume] in Blood by Manual count','Lymphocytes [#/volume] in Blood',
+#                         'C reactive protein [Mass/volume] in Serum or Plasma','C-reactive protein measurement',
+#                         'Platelets [#/volume] in Blood by Automated count','Platelets [#/volume] in Blood','Platelets [#/volume] in Blood by Automated count']
+    #df_filtered = df.filter(df.measurement_concept_name.isin(measurement_list))
+
+    #filtered_df = df_filtered.select(df_filtered.person_id, df_filtered.measurement_date, 
+#                                    df_filtered.measurement_concept_name, df_filtered.value_as_number)
+    # Pivot DataFrame
+    #pivoted_df = filtered_df.groupBy("person_id", "measurement_date").pivot("measurement_concept_name").agg(first("value_as_number"))
+
+    return(reorganize_measurement_dataset)
+
+def pivoted_measurement_by_concept_ID(reorganize_measurement_dataset):
+    df = reorganize_measurement_dataset
+
+    df = df.withColumn("measurement_concept_name", regexp_replace("measurement_concept_name", "[;]", "_"))
+    measurement_concept_id_list = ['3020460','21490872','3013502','4239408','3010156',
+                        '40769763','4301868','3004327','3013650','3027018',
+                        '3007461','3003215','45770406','4020553','2212762',
+                        '3000965','3024929','4017361','3016502','4096101',
+                        '3017732','3024171','3001376','4313591','2212761',
+                        '46272908','4196147','3035320','21490846','4208414',
+                        '40762499','3019198','3017501', '3013682']
+    df_filtered = df.filter(df.measurement_concept_id.isin(measurement_concept_id_list))
+
+    filtered_df = df_filtered.select(df_filtered.person_id, df_filtered.measurement_date, df_filtered.measurement_concept_id,
+                                    df_filtered.measurement_concept_name, df_filtered.value_as_number)
+    # Pivot DataFrame
+    #pivoted_df = filtered_df.groupBy("person_id", "measurement_date").pivot("measurement_concept_name").agg(first("value_as_number"))
+
+    return(pivoted_measurement_by_concept_ID)
+
+def group_by_measurement_name(pivoted_measurement_by_concept_ID):
+    df = pivoted_measurement_by_concept_ID
+    # Pivot DataFrame
+    pivoted_df = df.groupBy("person_id", "measurement_date").pivot("measurement_concept_name").agg(first("value_as_number"))
+
+    return(group_by_measurement_name)
+
+def join_measurement_within_56_window(twentyeight_days_window_screening, group_by_measurement_name):
+    df1 = group_by_measurement_name
+    df2 = twentyeight_days_window_screening
+
+    df1 = df1.withColumnRenamed("person_id", "person_id_measurement")
+
+    # Ensure the date columns are in the correct date format (if not already)
+    df1 = df1.withColumn("measurement_date", to_date(col("measurement_date")))
+    df2 = df2.withColumn("condition_start_date", to_date(col("condition_start_date")))
+
+    # Perform an inner join on person_id with a condition on the date
+    condition = (df1["person_id_measurement"] == df2["person_id"]) & \
+                (datediff(df2["condition_start_date"], df1["measurement_date"]) <= 28) & \
+                (datediff(df2["condition_start_date"], df1["measurement_date"]) >= -28)
+
+    joined_df = df2.join(df1, condition, "left")
+
+    return(join_measurement_within_56_window)
+
+def Filter_firstmeasurement_with_emptymatching(join_measurement_within_56_window):
+    df = join_measurement_within_56_window
+    
+    # Get all column names from the DataFrame
+    all_columns = df.columns
+
+    # Assuming you know the first few columns that are not measurement columns
+    non_measurement_columns = ['person_id', 'condition_start_date', 'person_id_records', 'total_visits', 
+    'observation_period', 'sex', 'city','state', 'postal_code', 'county', 'age', 'race', 'race_ethnicity', 
+    'data_partner_id', 'data_extraction_date', 'cdm_name', 'cdm_version', 'shift_date_yn', 'max_num_shift_days']
+
+    # Extract the last 50 measurement column names
+    measurement_columns = [col for col in all_columns if col not in non_measurement_columns]
+    # Group by "person_id" and "condition_start_date", and aggregate the measurement columns
+    grouped_df = df.groupBy("person_id", "condition_start_date")
+    agg_exprs = [
+        first(when(col(measurement).isNotNull(), col(measurement)).otherwise(None), ignorenulls=True).alias(f"{measurement}")
+        for measurement in measurement_columns
+    ]
+    agg_df = grouped_df.agg(*agg_exprs)
+
+    # Select the non-measurement columns based on the non_measurement_list
+    distinct_non_measurement_df = df.select(*non_measurement_columns).distinct()
+
+    # Join the aggregated DataFrame with the distinct non-measurement DataFrame on "person_id" and "condition_start_date"
+    result_df = distinct_non_measurement_df.join(agg_df, ["person_id", "condition_start_date"])
+
+
+    result_df = result_df.filter(col("person_id_measurement").isNotNull())
+
+    result_df = result_df.filter(length(col("postal_code")) == 5)
+
+
+
+    return(join_measurement_within_56_window)
+
+def Match_with_COUNTY_ratio(Filter_firstmeasurement_with_emptymatching, HUD_ZIP_to_County_Crosswalk):
+    df1 = Filter_firstmeasurement_with_emptymatching
+    df2 = HUD_ZIP_to_County_Crosswalk
+
+    # Name of the column to be removed
+    column_to_remove = "county"
+
+    # Remove the specified column
+    df1 = df1.drop(column_to_remove)
+    # If you want to join only several columns from df2, select these columns along with the joining key
+    df2_selected = df2.select("ZIP", "COUNTY", "TOT_RATIO")
+
+    # Perform the join operation
+    df_joined = df1.join(df2_selected, df1.postal_code == df2_selected.ZIP, "inner")
+
+    # Optionally, if you want to drop the duplicated postal_code column from df2 after the join
+    df_joined = df_joined.drop(df2_selected.ZIP)
+
+    return(Match_with_COUNTY_ratio)
+
+def Combine_different_measurement_names_no_env(Match_with_COUNTY_ratio):
+    df = Match_with_COUNTY_ratio
+    # Creating the "Heart_rate_remedy" column
+    df = df.withColumn("Heart_rate_remedy", 
+                    coalesce(
+                        df["Heart_rate"], 
+                        df["Heart_rate_Peripheral_artery_by_palpation__resting"],
+                        df["Heart_rate_beat_to_beat_by_EKG"],
+                        df["Heart_rate_by_Pulse_oximetry"],
+                        df["Pulse_rate"]
+                    ))
+
+    # List of columns to remove after creating "Heart_rate_remedy"
+    columns_to_remove = [
+        "Heart_rate", 
+        "Heart_rate_Peripheral_artery_by_palpation__resting",
+        "Heart_rate_beat_to_beat_by_EKG",
+        "Heart_rate_by_Pulse_oximetry",
+        "Pulse_rate"
+    ]
+
+    # Removing the original columns
+    df = df.drop(*columns_to_remove)
+
+
+
+    # Creating the "Respiratory_rate_remedy" column
+    df = df.withColumn("Respiratory_rate_remedy", 
+                    coalesce(
+                        df["Respiratory_rate"], 
+                        df["Respiratory_rate_by_Airway_flow_measurement"]
+                    ))
+
+    # List of additional columns to remove after creating "Respiratory_rate_remedy"
+    columns_to_remove_respiratory = [
+        "Respiratory_rate", 
+        "Respiratory_rate_by_Airway_flow_measurement"
+    ]
+
+    # Removing the additional original columns
+    df = df.drop(*columns_to_remove_respiratory)
+
+
+    # Creating the "SpO2_remedy" column
+    df = df.withColumn("SpO2_remedy", 
+                    coalesce(
+                        df["Oxygen_saturation_in_Arterial_blood_by_Pulse_oximetry"], 
+                        df["Oxygen_saturation_in_Arterial_blood"],
+                        df["Oxygen_saturation_in_Blood"],
+                        df["Oxygen_saturation_measurement"],
+                        df["Peripheral_oxygen_saturation"],
+                        df["Baseline_SpO2_oxygen_saturation_at_periphery_"],
+                        df["Measurement_of_oxygen_saturation_at_periphery"]
+                    ))
+
+    # List of columns to remove after creating "SpO2_remedy"
+    columns_to_remove_spo2 = [
+        "Oxygen_saturation_in_Arterial_blood_by_Pulse_oximetry",
+        "Oxygen_saturation_in_Arterial_blood",
+        "Oxygen_saturation_in_Blood",
+        "Oxygen_saturation_measurement",
+        "Peripheral_oxygen_saturation",
+        "Baseline_SpO2_oxygen_saturation_at_periphery_",
+        "Measurement_of_oxygen_saturation_at_periphery"
+    ]
+
+    # Removing the original columns used for "SpO2_remedy"
+    df = df.drop(*columns_to_remove_spo2)
+
+    # Creating the "CRP_remedy" column
+    df = df.withColumn("CRP_remedy", 
+                    coalesce(
+                        df["C_reactive_protein_[Massvolume]_in_Serum_or_Plasma"], 
+                        df["C_reactive_protein_[Massvolume]_in_Serum_or_Plasma_by_High_sensitivity_method"],
+                        df["C_reactive_protein_[Massvolume]_in_Body_fluid"],
+                        #df["C_reactive_protein"],
+                        df["C_reactive_protein_[Presence]_in_Serum_or_Plasma"],
+                        #df["C_reactive_protein__high_sensitivity_hsCRP_"],
+                        df["C_reactive_protein_measurement"]
+                    ))
+
+    # List of columns to remove after creating "CRP_remedy"
+    columns_to_remove_crp = [
+        "C_reactive_protein_[Massvolume]_in_Serum_or_Plasma",
+        "C_reactive_protein_[Massvolume]_in_Serum_or_Plasma_by_High_sensitivity_method",
+        "C_reactive_protein_[Massvolume]_in_Body_fluid",
+        "C_reactive_protein",
+        "C_reactive_protein_[Presence]_in_Serum_or_Plasma",
+        "C_reactive_protein__high_sensitivity_hsCRP_",
+        "C_reactive_protein_measurement"
+    ]
+
+    # Removing the original columns used for "CRP_remedy"
+    df = df.drop(*columns_to_remove_crp)
+
+
+    # Creating the "Lym_remedy" column
+    df = df.withColumn("Lym_remedy", 
+                    coalesce(
+                        df["Lymphocytes_[volume]_in_Blood_by_Automated_count"], 
+                        df["Lymphocytes_[volume]_in_Blood_by_Manual_count"],
+                        df["Lymphocytes_[volume]_in_Blood"]
+                    ))
+
+    # List of columns to remove after creating "Lym_remedy"
+    columns_to_remove_lym = [
+        "Lymphocytes_[volume]_in_Blood_by_Automated_count",
+        "Lymphocytes_[volume]_in_Blood_by_Manual_count",
+        "Lymphocytes_[volume]_in_Blood"
+    ]
+
+    # Removing the original columns used for "Lym_remedy"
+    df = df.drop(*columns_to_remove_lym)
+
+    # Creating the "Neu_remedy" column
+    df = df.withColumn("Neu_remedy", 
+                    coalesce(
+                        df["Neutrophils_[volume]_in_Blood_by_Automated_count"], 
+                        df["Neutrophils_[volume]_in_Blood_by_Manual_count"],
+                        df["Neutrophils_[volume]_in_Blood"]
+                    ))
+
+    # List of columns to remove after creating "Neu_remedy"
+    columns_to_remove_neu = [
+        "Neutrophils_[volume]_in_Blood_by_Automated_count",
+        "Neutrophils_[volume]_in_Blood_by_Manual_count",
+        "Neutrophils_[volume]_in_Blood"
+    ]
+
+    # Removing the original columns used for "Neu_remedy"
+    df = df.drop(*columns_to_remove_neu)
+
+
+    # Creating the "PLA_remedy" column
+    df = df.withColumn("PLA_remedy", 
+                    coalesce(
+                        df["Platelets_[volume]_in_Blood_by_Automated_count"], 
+                        df["Platelets_[volume]_in_Blood"]
+                    ))
+
+    # List of columns to remove after creating "PLA_remedy"
+    columns_to_remove_pla = [
+        "Platelets_[volume]_in_Blood_by_Automated_count",
+        "Platelets_[volume]_in_Blood"
+    ]
+
+    # Removing the original columns used for "PLA_remedy"
+    df = df.drop(*columns_to_remove_pla)
+
+    # Creating the "BUN_remedy" column
+    df = df.withColumn("BUN_remedy", 
+                    coalesce(
+                        df["Urea_nitrogen_[Massvolume]_in_Serum_or_Plasma"], 
+                        df["Blood_urea_nitrogen_measurement"]
+                    ))
+
+    # List of columns to remove after creating "PLA_remedy"
+    columns_to_remove_bun = [
+        "Urea_nitrogen_[Massvolume]_in_Serum_or_Plasma",
+        "Blood_urea_nitrogen_measurement"
+    ]
+
+    # Removing the original columns used for "PLA_remedy"
+    df = df.drop(*columns_to_remove_bun)
+
+    df_with_nlr = df.withColumn(
+    "NLR_remedy",
+    when(
+        (col("Neu_remedy").isNotNull()) & (col("Lym_remedy").isNotNull()),
+        col("Neu_remedy") / col("Lym_remedy")
+        )
+    )
+
+
+
+
+    return(Combine_different_measurement_names_no_env)
+
+
+
+
+  
+
+
+    
+
+
